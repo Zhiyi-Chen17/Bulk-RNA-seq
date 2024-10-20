@@ -1,0 +1,376 @@
+---
+title: "GM1142_GM4779_RNA-seq_testisP7差异表达分析"
+author: "陈志毅"
+date: "2024-06-28"
+output:  
+  html_document:  
+    toc: true  
+    number_sections: true  
+---
+参考链接：\
+https://master.bioconductor.org/packages/release/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html
+
+
+```{r message=FALSE, warning=FALSE}
+#加载程式包
+#install.packages("BiocManager")
+#BiocManager::install("DESeq2")
+#BiocManager::install("biomaRt")
+#BiocManager::install("apeglm")
+#BiocManager::install("IHW")
+#BiocManager::install("vsn")
+#BiocManager::install("genefilter")
+#install.packages("curl")
+library('tidyverse')
+library('DESeq2')
+library('biomaRt')
+library("curl")
+```
+
+# 导入数据，配置信息\
+  数据结构见参考链接，该数据来stritie输出的gtf转换的count。
+
+```{r}
+# 传入原始 count 矩阵
+my_counts<-read.csv("../gene_count_matrix.csv")
+#查看一下数据结构
+head(my_counts)
+```
+
+## 删除id中的版本号，方便后续分析和ID转换等操作。
+```{r}
+# 删除 id 中的版本号
+my_counts$gene_id <- gsub("\\..*", "", my_counts$gene_id)
+# 将 id 作为行名，并删除多余 id 列
+rownames(my_counts)<-my_counts[,1]
+my_counts<-my_counts[,-1]
+head(my_counts)
+```
+
+## 获取基因补充信息，如 symbol ID
+这里使用了ensembl 100，对应我们在前期处理中使用的gencode.vM25.chr_patch_hapl_scaff.annotation.gtf注释文件
+```{r message=FALSE, warning=FALSE}
+#mart <- useDataset("mmusculus_gene_ensembl", useMart("ensembl"))
+options(timeout = 4000000)
+#查看可用版本
+#listEnsemblArchives()
+#listEnsembl(version = 107)
+
+#使用vM30对应的参考数据库ensembl 107
+ensembl107 <- useEnsembl(biomart = 'genes', 
+                         dataset = 'mmusculus_gene_ensembl',
+                         version = 107)
+#获取ensembl_gene_id然后获取对应的mgi_symbol、entrezgene_id、chromosome_name。
+options(timeout = 4000000)
+my_ensembl_gene_id<-rownames(my_counts)
+option_info<- getBM(
+  attributes = c("ensembl_gene_id","mgi_symbol","entrezgene_id","chromosome_name"),
+  filters = 'ensembl_gene_id',
+  values = my_ensembl_gene_id,
+  mart = ensembl107)
+```
+
+## 配置样本信息
+DESeqDataSet对象的的coldata中储存样本分组信息（实验设计类型），我们有三个KO和3个WT，在这里我们先对colData进行配置。
+```{r}
+## 配置分组信息
+condition <- factor(c(rep("KO",3),rep("control",3)), levels = c("KO","control"))
+##将分组信息转换为data.frame
+colData <- data.frame(row.names=colnames(my_counts), condition)
+#加入样品信息，便于作PCA图
+colData$sample <- colnames(my_counts)
+#查看一下colData
+colData
+```
+
+## 构造DESeqDataSet对象
+这里我们使用DESeqDataSetFromMatrix方法，不同的表达矩阵来源的导入方式见参考链接。
+```{r}
+dds <- DESeqDataSetFromMatrix(my_counts, colData, design= ~ condition)
+```
+
+由于R语言默认因子水平的第一个是比较组，我们可以查看因子顺序并用relevel函数将对照组调整为因子的第一个，
+```{r}
+dds$condition
+```
+注意，不能直接使用levels(dds$condition) <- c("control", "knockout"),relevel可以决定了变量将如何编码，以及如何计算对比。
+```{r}
+dds$condition <- relevel(dds$condition, ref = "control")
+dds$condition
+```
+
+# 探索性分析和可视化
+## 数据预过滤
+对6个样本总counts小于10的基因进行删除，可以增加分析速度并提高检验效能。
+注：即使不对count进行过滤，在进行p值矫正时仍然会不对低count基因进行检验，以提高检验效能，降低总体的I类错误率。
+```{r}
+nrow(dds)
+```
+
+检查哪些基因在至少3个样本中的计数大于或等于10。这将返回一个逻辑向量，其中TRUE表示对应的基因满足条件，FALSE表示不满足。
+```{r}
+smallestGroupSize <- 3 #设置组别
+#设置过滤条件，构造逻辑向量
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+#按逻辑向量对基因进行过滤
+dds <- dds[keep,]
+nrow(dds)
+```
+
+
+
+## 方差稳定变换
+在许多统计模型中（如聚类PCA），需要使得数据满足同方差性homoskedastic。（同方差性：不同的平均count的方差相同）\
+大多数时候，方差随着平均值的增大而增大，所以PCA中各组间差异会取决于count值较大的值。\
+但是在组学分析中，我们比较平等地看待每个基因，所以需要矫正每个基因count值差异过大导致方差不平等的情况。\
+取log值、vst和rlong是三种常用的方法。我们直接比较三种方法的优劣。\
+
+
+注意：方差稳定性转变的结果仅用于探索性分析，而不用于差异分析本身。
+
+首先看一下方差稳定性转变的功效,从下面的图可以看出，每种方法都可以进行同方差转换，其中，vsn方法的曲线最符合同方差性。
+
+```{r}
+# 做log2(n + 1)转换
+ntd <- normTransform(dds)
+vsd <- vst(dds, blind=FALSE) #vst转换
+rld <- rlog(dds, blind=FALSE) #rlong转换
+
+```
+
+```{r}
+# 设置图形参数以在一个设备中绘制多个图  
+library(vsn)
+  
+# 绘制每个图  
+meanSdPlot(assay(dds))  
+meanSdPlot(assay(ntd))  
+meanSdPlot(assay(vsd))  
+meanSdPlot(assay(rld))  
+
+```
+
+
+以T5-KO1和T5-KO-2两个样本为例，从下图可以看出，VST有以下优点：\
+1、在log2(X+1)图左下角有许多低计数基因，他们的方差不稳定，而在vst图中，这些低计数基因上移且方差稳定性增高（离y=x更近）。\
+2、所有count下的基因更好的聚成团，意味着方差同性更好。
+```{r}
+library("dplyr")
+library("ggplot2")
+dds <- estimateSizeFactors(dds)
+df <- bind_rows(
+  as.data.frame(assay(ntd)[, 1:2]) %>%
+    mutate(transformation = "log2(x + 1)"),
+  as.data.frame(assay(vsd)[, 1:2]) %>% mutate(transformation = "vst"),
+  as.data.frame(assay(rld)[, 1:2]) %>% mutate(transformation = "rlog"))
+
+#将T5-KO1和T5-KO-2转化为x和y
+colnames(df)[1:2] <- c("x", "y")  
+
+lvls <- c("log2(x + 1)", "vst", "rlog")
+df$transformation <- factor(df$transformation, levels=lvls)
+
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation) 
+```
+
+
+## 使用转换后的数据计算样本间距离
+样本距离计算和查看\
+注：这里计算的是样本间欧式距离：$√Σ(vect1i - vect2i)2$
+
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+sampleDists
+```
+
+### 可视化聚类
+可以看到WT和KO组明显分开，但是我们的WT1和KO1与其余样品是不同批次样品，存在一定的组间差异。
+```{r}
+library("pheatmap")
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix( sampleDists )
+colors <- colorRampPalette( rev(brewer.pal(6, "Blues")) )(255)
+PDIS<-pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+tiff("SAMPLE_HEATMAP.tiff", res = 600, width = 5200, height = 4800, compression = "lzw")
+print(PDIS)
+dev.off()
+```
+
+### PCA图绘制
+PCA图的结果良好，PCA1(87%variance)解释了87%的方差，所以WT组和KO组组间差异小，但组内仍然有差异。
+```{r}
+pcaData <- plotPCA(vsd, intgroup = c( "condition", "sample"), returnData = TRUE)
+pcaData
+```
+
+```{r}
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+PCA_PLOT <- ggplot(pcaData, aes(x = PC1, y = PC2, color =condition)) +scale_y_continuous(limits = c(-6, 6))+
+  geom_point(size =3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("PCA with VST data")+ theme_minimal() + theme_bw()+ theme(panel.grid = element_blank())+theme(legend.position = "right")
+
+tiff("PCA1.tiff", res = 600, width = 4800, height = 4800, compression = "lzw")
+print(PCA_PLOT)
+dev.off()
+```
+
+# 进行差异分析
+## 运行差异分析pipeline
+使用已经建立好的DESeqDataSet对象，DESeq函数会自动进行整个分析流程并打印流程，可以使用?DESeq了解具体步骤信息。\
+主要包括：估计大小因子（控制样本测序深度的差异），估计每个基因的离散值，以及拟合广义线性模型。
+```{r}
+dds <- DESeq(dds)
+```
+
+## 建立结果表
+使用results函数指定比较方法，生成log2 fold changes和p values。
+```{r}
+# 生成结果表，配置比较顺序 knockout vs control
+res_ko= results(dds,contrast=c("condition","KO","control"))
+res_ko
+```
+
+
+
+
+这里我们指定了收缩系数的 apeglm 方法，即有利于缩小噪声的LFC估计值。
+```{r}
+#加载对LFC进行收缩的模型
+library("apeglm")
+#查看比较组
+resultsNames(dds)
+```
+`
+
+
+```{r}
+#对lfc进行收缩
+plotMA(res_ko, ylim = c(-5, 5))
+
+res_ko <- lfcShrink(dds, coef="condition_KO_vs_control", type="apeglm")
+#查看调节噪声以后的MA图
+plotMA(res_ko, ylim = c(-5, 5))
+```
+
+MA图突出了RNA-seq数据的一个重要特性。对于弱表达的基因，我们没有机会看到差异表达，因为低读取计数受到如此高的泊松噪声的影响，以至于任何生物学效应都淹没在低速采样带来的不确定性中。
+
+
+## 对基因进行聚类
+对基因进行聚类可以展示那些组间差别最大的基因，并且展示这些基因在样本中的分布，使用的数据是经过方差稳定性转换的数据vsd，基因是方差排在前20的基因。\
+热图展示了每个基因在特定样本中偏离所有样本基因平均值的量。
+```{r message=FALSE, warning=FALSE}
+library("genefilter")
+#取方差前20基因
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 20)
+
+#构造前20个基因的表达矩阵并减去平均表达量
+mat  <- assay(vsd)[ topVarGenes, ]
+mat  <- mat - rowMeans(mat)
+
+#mat的将ensembl_gene_id转换为mgi_symbol
+mat_df<- as.data.frame(mat) #将矩阵数据转化为数据框
+mat_df$ensembl_gene_id = row.names(mat_df) #获取ensembl_gene_id列
+mat_df_mgi<-merge(mat_df,option_info,by="ensembl_gene_id") #加入补充信息
+rownames(mat_df_mgi) <- mat_df_mgi$mgi_symbol #重命名行名
+# 选择要保留的列进行重构
+#mat_rename <- mat_df_mgi[, c('', 'Miwi_null_2', 'WT_1', 'WT_2')]
+anno <- as.data.frame(colData(vsd)[, c("sample","condition")])
+pheatmap(mat_df_mgi, annotation_col = anno)
+```
+```{r}
+#整合normalized count和差异分析结果
+res_ko <- merge(as.data.frame(res_ko), as.data.frame(counts(dds, normalized = TRUE)), by = "row.names", sort = FALSE)
+res_ko
+```
+
+
+图中可以看到，有一组基因在KO组中显著下调了，这是组间差异最大的基因，另一簇基因在KO组中有上调，但是组内重复性较差，并且差异来源主要是可能有批次效应的T5-KO-1,后续可以针对这些基因进行深入研究。
+
+
+
+# 注释和导出结果
+```{r}
+#进行排序
+res_ko = res_ko[order(res_ko$pvalue),]
+```
+
+
+## 转换 DESeqResults 为 data.frame() 对象，加入补充信息
+
+```{r}
+#获取ensembl_gene_id列
+res_ko$ensembl_gene_id = res_ko$Row.names
+
+#转换 DESeqResults 为 data.frame() 对象，加入补充信息
+res_ko_with_chr_info<-merge(data.frame(res_ko),option_info,by="ensembl_gene_id")
+res_ko_with_chr_info <- res_ko_with_chr_info[,-2]
+```
+
+
+
+## 保存全部结果
+```{r}
+write.csv(res_ko_with_chr_info,file="KO_DEG_All_results.csv",row.names = F)
+```
+
+# 保存筛选后的结果
+
+设置筛选条件为padj < 0.05&|log2FoldChange| > 1 
+```{r}
+diff_gene_deseq2 <-subset(res_ko_with_chr_info,padj < 0.05
+                          & (log2FoldChange > 1 | log2FoldChange < -1))
+```
+```{r}
+dim(diff_gene_deseq2)
+```
+```{r}
+write.csv(diff_gene_deseq2,file= "KO_up_and_down_FC1.csv",row.names = F)
+```
+```{r}
+diff_gene_deseq2_UP <-subset(res_ko_with_chr_info,padj < 0.05
+                          & log2FoldChange > 1 )
+write.csv(diff_gene_deseq2_UP,file= "KO_up_FC1.csv",row.names = F)
+
+diff_gene_deseq2_DOWN <-subset(res_ko_with_chr_info,padj < 0.05
+                          &  log2FoldChange < -1)
+write.csv(diff_gene_deseq2_DOWN,file= "KO_down_FC1.csv",row.names = F)
+
+```
+# 保存筛选后的结果
+
+设置筛选条件为padj < 0.05&|log2FoldChange| > 0.6 
+```{r}
+diff_gene_deseq2 <-subset(res_ko_with_chr_info,padj < 0.05
+                          & (log2FoldChange > 0.6 | log2FoldChange < -0.6))
+```
+```{r}
+dim(diff_gene_deseq2)
+```
+```{r}
+write.csv(diff_gene_deseq2,file= "KO_up_and_down_FC0.6.csv",row.names = F)
+```
+```{r}
+diff_gene_deseq2_UP <-subset(res_ko_with_chr_info,padj < 0.05
+                          & log2FoldChange > 0.6 )
+write.csv(diff_gene_deseq2_UP,file= "KO_up_FC0.6.csv",row.names = F)
+
+diff_gene_deseq2_DOWN <-subset(res_ko_with_chr_info,padj < 0.05
+                          &  log2FoldChange < -0.6)
+write.csv(diff_gene_deseq2_DOWN,file= "KO_down_FC0.6.csv",row.names = F)
+
+```
+
+
+
+
+
+
+
+

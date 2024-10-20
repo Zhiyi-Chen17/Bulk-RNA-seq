@@ -1,0 +1,96 @@
+---
+title: "GSEA_PICTURES"
+author: "chenzhiyi"
+date: "2024-06-27"
+
+---
+
+# P16
+
+
+```{r echo=FALSE}
+tiff("../output/HSF5_P16_GSEA_all.tif",res = 600, compression = "lzw", width=14, height=8, units="in")
+
+gseaplot2(P16_gsea,
+          title = "HSF5_P16",  #设置title
+          geneSetID = 1:7, #选择要绘制的基因集
+          color="red", #线条颜色
+          base_size = 20, #基础字体的大小
+          subplots = 1:3, #展示的内容
+          pvalue_table = T) # 显示p值
+dev.off()
+
+```
+
+# P16
+```{r echo=FALSE}
+tiff("../output/HSF5_P16_GSEA_all_NO_TABLE.tif",res = 600, compression = "lzw", width=14, height=8, units="in")
+
+gseaplot2(P16_gsea,
+          title = "HSF5_P16",  #设置title
+          geneSetID = 1:7, #选择要绘制的基因集
+          color="red", #线条颜色
+          base_size = 20, #基础字体的大小
+          subplots = 1:3, #展示上3部分
+          pvalue_table = F) # 不显示p值
+dev.off()
+```
+
+
+```{r include=FALSE}
+
+geneSetIDs <- c(1:7) # 替换为实际的geneSetID  
+  
+# 初始化列表来存储图形对象  
+plots <- list()  
+  
+# 使用循环为每个geneSetID生成图形  
+for (i in seq_along(geneSetIDs)) {  
+  geneSetID <- geneSetIDs[i]  
+  plot_title <- paste("HSF5_P16")  
+    
+  # 调用gseaplot2并将结果存储在列表中  
+  plots[[i]] <- gseaplot2(P16_gsea,  
+                          title = plot_title,  
+                          geneSetID = geneSetID,  
+                          color = "red",  
+                          base_size = 20,  
+                          subplots = 1:3,  
+                          pvalue_table = TRUE)  
+  
+  tiff(paste0('../output/',"GSEA_", i, ".tif"),res = 600, compression = "lzw", width=14, height=8, units="in")
+  print(plots[[i]])  
+  dev.off()
+}  
+  
+```
+
+```{r include=FALSE}
+
+geneSetIDs <- c(1:7) # 替换为实际的geneSetID  
+  
+# 初始化列表来存储图形对象  
+plots_N <- list()  
+  
+# 使用循环为每个geneSetID生成图形  
+for (i in seq_along(geneSetIDs)) {  
+  geneSetID <- geneSetIDs[i]  
+  plot_title <- paste("HSF5_P16")  
+    
+  # 调用gseaplot2并将结果存储在列表中  
+  plots_N[[i]] <- gseaplot2(P16_gsea,  
+                          title = plot_title,  
+                          geneSetID = geneSetID,  
+                          color = "red",  
+                          base_size = 20,  
+                          subplots = 1:3,  
+                          pvalue_table = F)  
+  
+  tiff(paste0('../output/',"GSEA_", i, 'NO_TABLE',".tif"),res = 600, compression = "lzw", width=14, height=8, units="in")
+  print(plots_N[[i]])  
+  dev.off()
+}  
+  
+```
+
+
